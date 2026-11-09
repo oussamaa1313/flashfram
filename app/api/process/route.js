@@ -112,9 +112,12 @@ export async function POST(request) {
       );
     }
 
-    const files = form.getAll("videos").filter(
-      (file) => file instanceof File && file.size > 0
-    );
+   const files = form.getAll("videos").filter(
+  (file) =>
+    file &&
+    typeof file.arrayBuffer === "function" &&
+    file.size > 0
+);
 
     if (files.length < 1 || files.length > 3) {
       return NextResponse.json(
