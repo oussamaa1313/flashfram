@@ -1,17 +1,26 @@
 
 import { NextResponse } from "next/server";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
-import path from "node:path";
 import { Readable } from "node:stream";
+import {
+  S3Client,
+  GetObjectCommand,
+} from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: process.env.R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
 
 export async function GET(request, context) {
   try {
     const { filename } = await context.params;
 
-    // Allow only generated UUID-based MP4 filenames.
     if (!/^[a-f0-9-]{36}\.mp4$/i.test(filename)) {
       return NextResponse.json(
         { error: "Invalid download filename." },
@@ -19,38 +28,57 @@ export async function GET(request, context) {
       );
     }
 
-    const filePath = path.join(
-      process.cwd(),
-      "public",
-      "downloads",
-      filename
+    if (!process.env.R2_BUCKET_NAME) {
+      return NextResponse.json(
+        { error: "R2 bucket configuration is missing." },
+        { status: 500 }
+      );
+    }
+
+    const objectKey = `processed/${filename.replace(".mp4", "")}.mp4`;
+
+    const result = await r2.send(
+      new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: objectKey,
+      })
     );
 
-    const fileInfo = await stat(filePath);
-
-    if (!fileInfo.isFile()) {
+    if (!result.Body) {
       return NextResponse.json(
         { error: "Video not found." },
         { status: 404 }
       );
     }
 
-    const stream = createReadStream(filePath);
+    const stream = result.Body;
 
     return new Response(Readable.toWeb(stream), {
       headers: {
         "Content-Type": "video/mp4",
-        "Content-Length": String(fileInfo.size),
+        "Content-Length": String(result.ContentLength || 0),
         "Content-Disposition": `attachment; filename="${filename}"`,
         "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
       },
     });
+
   } catch (error) {
-    console.error("Download error:", error);
+    console.error("R2 download error:", error);
+
+    if (
+      error.name === "NoSuchKey" ||
+      error.name === "NotFound"
+    ) {
+      return NextResponse.json(
+        { error: "Video not found." },
+        { status: 404 }
+      );
+    }
 
     return NextResponse.json(
-      { error: "Download file not found or unavailable." },
-      { status: 404 }
+      { error: "Download unavailable. Please try again." },
+      { status: 500 }
     );
   }
 }
