@@ -13,6 +13,7 @@ import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
+
 import {
   S3Client,
   PutObjectCommand,
@@ -21,6 +22,7 @@ import {
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
+// Cloudflare R2 connection
 const r2 = new S3Client({
   region: "auto",
   endpoint: process.env.R2_ENDPOINT,
@@ -30,6 +32,7 @@ const r2 = new S3Client({
   },
 });
 
+// FFmpeg processing
 function runFFmpeg(input, image, output) {
   return new Promise((resolve, reject) => {
     const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
@@ -37,16 +40,17 @@ function runFFmpeg(input, image, output) {
     const args = [
       "-y",
       "-hide_banner",
-      "-loglevel", "warning",
+      "-loglevel", "error",
       "-filter_threads", "1",
       "-filter_complex_threads", "1",
 
       "-i", input,
       "-loop", "1",
+      "-framerate", "30",
       "-i", image,
 
       "-filter_complex",
-      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto[v]",
+      "[1:v][0:v]scale2ref=w=rw:h=rh[img][base];[img]format=rgba[img2];[base][img2]overlay=0:0:enable='lt(mod(t,2),0.04)':eof_action=repeat:format=auto[v]",
 
       "-map", "[v]",
       "-map", "0:a?",
@@ -62,31 +66,33 @@ function runFFmpeg(input, image, output) {
 
       "-shortest",
       "-movflags", "+faststart",
+
       output,
     ];
 
     const proc = spawn(ffmpegPath, args);
+
     let errorText = "";
 
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
 
-      if (errorText.length > 15000) {
-        errorText = errorText.slice(-15000);
+      if (errorText.length > 12000) {
+        errorText = errorText.slice(-12000);
       }
     });
 
     proc.on("error", (error) => {
-      reject(new Error(`Unable to start FFmpeg: ${error.message}`));
+      reject(new Error(`FFmpeg startup failed: ${error.message}`));
     });
 
-    proc.on("close", (code, signal) => {
+    proc.on("close", (code) => {
       if (code === 0) {
         resolve();
       } else {
         reject(
           new Error(
-            `FFmpeg failed. Exit code: ${code}, Signal: ${signal}\n${errorText.slice(-5000)}`
+            `FFmpeg failed with code ${code}: ${errorText.slice(-4000)}`
           )
         );
       }
@@ -94,12 +100,28 @@ function runFFmpeg(input, image, output) {
   });
 }
 
+// Upload processed video to R2
+async function uploadToR2(filePath, filename) {
+  const fileInfo = await stat(filePath);
+
+  await r2.send(
+    new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: `processed/${filename}`,
+      Body: createReadStream(filePath),
+      ContentLength: fileInfo.size,
+      ContentType: "video/mp4",
+    })
+  );
+}
+
+// Main API
 export async function POST(request) {
   let tempDir;
-  const uploadedKeys = [];
 
   try {
-    const requiredVariables = [
+    // Check environment variables
+    const required = [
       "STRIPE_SECRET_KEY",
       "R2_ENDPOINT",
       "R2_ACCESS_KEY_ID",
@@ -107,15 +129,16 @@ export async function POST(request) {
       "R2_BUCKET_NAME",
     ];
 
-    for (const variable of requiredVariables) {
-      if (!process.env[variable]) {
+    for (const key of required) {
+      if (!process.env[key]) {
         return NextResponse.json(
-          { error: `Missing server variable: ${variable}` },
+          { error: `Missing environment variable: ${key}` },
           { status: 500 }
         );
       }
     }
 
+    // Read upload form
     const form = await request.formData();
     const sessionId = form.get("session_id");
 
@@ -124,13 +147,17 @@ export async function POST(request) {
       !/^cs_(test|live)_/.test(sessionId)
     ) {
       return NextResponse.json(
-        { error: "A valid Stripe Checkout session is required." },
+        { error: "Invalid Stripe session." },
         { status: 400 }
       );
     }
 
+    // Verify Stripe payment
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId
+    );
 
     if (
       session.payment_status !== "paid" ||
@@ -143,6 +170,7 @@ export async function POST(request) {
       );
     }
 
+    // Get uploaded videos
     const files = form.getAll("videos").filter(
       (file) =>
         file &&
@@ -157,66 +185,91 @@ export async function POST(request) {
       );
     }
 
+    // Validate files
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          { error: "Each file must be a video smaller than 250 MB." },
+          { error: "Each video must be smaller than 250 MB." },
           { status: 400 }
         );
       }
     }
 
+    // Check cat image
     const imagePath = path.join(
       process.cwd(),
       "public",
       "cat-image.png"
     );
 
-    await access(imagePath);
+    try {
+      await access(imagePath);
+    } catch {
+      return NextResponse.json(
+        { error: "Missing public/cat-image.png." },
+        { status: 400 }
+      );
+    }
 
+    // Temporary processing directory
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
     const results = [];
 
+    // Process each video
     for (const file of files) {
       const id = randomUUID();
-      const inputPath = path.join(tempDir, `${id}-input`);
-      const outputPath = path.join(tempDir, `${id}.mp4`);
-      const objectKey = `processed/${id}.mp4`;
 
+      const inputPath = path.join(
+        tempDir,
+        `${id}-input`
+      );
+
+      const outputName = `${id}.mp4`;
+
+      const outputPath = path.join(
+        tempDir,
+        outputName
+      );
+
+      // Save original video temporarily
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
-      await runFFmpeg(inputPath, imagePath, outputPath);
-
-      const outputInfo = await stat(outputPath);
-
-      await r2.send(
-        new PutObjectCommand({
-          Bucket: process.env.R2_BUCKET_NAME,
-          Key: objectKey,
-          Body: createReadStream(outputPath),
-          ContentLength: outputInfo.size,
-          ContentType: "video/mp4",
-        })
+      // Add cat image every 2 seconds
+      await runFFmpeg(
+        inputPath,
+        imagePath,
+        outputPath
       );
 
-      uploadedKeys.push(objectKey);
+      // Upload final video to Cloudflare R2
+      await uploadToR2(
+        outputPath,
+        outputName
+      );
 
+      // Return download API URL
       results.push({
-        url: `/api/download/${id}.mp4`,
+        filename: outputName,
+        url: `/api/download/${outputName}`,
       });
+
+      // Remove temporary files
+      await rm(inputPath, { force: true });
+      await rm(outputPath, { force: true });
     }
 
     return NextResponse.json({
       success: true,
+      message: "Videos processed and uploaded to Cloudflare R2.",
       files: results,
     });
 
