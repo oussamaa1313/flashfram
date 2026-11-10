@@ -1,6 +1,7 @@
 
 import { NextResponse } from "next/server";
 import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { createHmac, timingSafeEqual } from "node:crypto";
 import { Readable } from "node:stream";
 
 export const runtime = "nodejs";
@@ -17,11 +18,46 @@ const r2 = new S3Client({
 export async function GET(request, context) {
   try {
     const { filename } = await context.params;
+    const { searchParams } = new URL(request.url);
 
-    if (!/^[a-f0-9-]{36}\.mp4$/i.test(filename)) {
+    const expires = searchParams.get("expires");
+    const signature = searchParams.get("signature");
+    const secret = process.env.DOWNLOAD_SECRET;
+
+    if (
+      !secret ||
+      !/^[a-f0-9-]{36}\.mp4$/i.test(filename) ||
+      !expires ||
+      !/^\d+$/.test(expires) ||
+      !signature ||
+      !/^[a-f0-9]{64}$/i.test(signature)
+    ) {
       return NextResponse.json(
-        { error: "Invalid filename." },
-        { status: 400 }
+        { error: "Invalid download link" },
+        { status: 403 }
+      );
+    }
+
+    if (Number(expires) < Math.floor(Date.now() / 1000)) {
+      return NextResponse.json(
+        { error: "Download link expired" },
+        { status: 403 }
+      );
+    }
+
+    const expected = createHmac("sha256", secret)
+      .update(`${filename}:${expires}`)
+      .digest("hex");
+
+    const valid = timingSafeEqual(
+      Buffer.from(signature, "hex"),
+      Buffer.from(expected, "hex")
+    );
+
+    if (!valid) {
+      return NextResponse.json(
+        { error: "Invalid signature" },
+        { status: 403 }
       );
     }
 
@@ -34,27 +70,26 @@ export async function GET(request, context) {
 
     if (!result.Body) {
       return NextResponse.json(
-        { error: "Video not found." },
+        { error: "File not found" },
         { status: 404 }
       );
     }
 
-    const stream = Readable.toWeb(result.Body);
-
-    return new Response(stream, {
-      headers: {
-        "Content-Type": "video/mp4",
-        "Content-Disposition": `attachment; filename="${filename}"`,
-        "Content-Length": String(result.ContentLength),
-        "Cache-Control": "private, no-store",
-      },
-    });
-
+    return new Response(
+      Readable.toWeb(result.Body),
+      {
+        headers: {
+          "Content-Type": "video/mp4",
+          "Content-Disposition": `attachment; filename="${filename}"`,
+          "Cache-Control": "private, no-store",
+        },
+      }
+    );
   } catch (error) {
-    console.error("R2 download error:", error);
+    console.error("Download error:", error);
 
     return NextResponse.json(
-      { error: "Video not found or unavailable." },
+      { error: "Download failed" },
       { status: 404 }
     );
   }
