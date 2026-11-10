@@ -37,7 +37,7 @@ const r2 = new S3Client({
   },
 });
 
-// FFmpeg processing with diagnostic logs
+// FFmpeg optimized for 1 GB RAM
 function runFFmpeg(input, image, output) {
   return new Promise((resolve, reject) => {
     const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
@@ -46,31 +46,45 @@ function runFFmpeg(input, image, output) {
       "-y",
       "-hide_banner",
       "-loglevel", "error",
+
+      // Reduce decoder and filter threads
+      "-threads", "1",
       "-filter_threads", "1",
       "-filter_complex_threads", "1",
+
       "-i", input,
+
       "-loop", "1",
       "-framerate", "30",
       "-i", image,
+
+      // Resize video before overlay to reduce memory usage.
+      // Maximum dimensions: 1280x1280, preserving aspect ratio.
       "-filter_complex",
-      "[1:v][0:v]scale2ref=w=rw:h=rh[img][base];[img]format=rgba[img2];[base][img2]overlay=0:0:enable='lt(mod(t,2),0.04)':eof_action=repeat:format=auto[v]",
+      "[0:v]scale=1280:1280:force_original_aspect_ratio=decrease:force_divisible_by=2[base];[1:v][base]scale2ref=w=rw:h=rh[img][base2];[img]format=rgba[img2];[base2][img2]overlay=0:0:enable='lt(mod(t,2),0.04)':eof_action=repeat:format=auto[v]",
+
       "-map", "[v]",
       "-map", "0:a?",
+
       "-c:v", "libx264",
       "-preset", "ultrafast",
       "-threads", "1",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
+
       "-c:a", "aac",
       "-b:a", "128k",
+
       "-shortest",
       "-movflags", "+faststart",
+
       output,
     ];
 
     const proc = spawn(ffmpegPath, args);
 
     let errorText = "";
+    let settled = false;
 
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
@@ -81,6 +95,9 @@ function runFFmpeg(input, image, output) {
     });
 
     proc.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+
       console.error("FFmpeg startup error:", error);
 
       reject(
@@ -89,6 +106,9 @@ function runFFmpeg(input, image, output) {
     });
 
     proc.on("close", (code, signal) => {
+      if (settled) return;
+      settled = true;
+
       console.error("FFmpeg diagnostic:", {
         code,
         signal,
@@ -123,7 +143,7 @@ async function uploadToR2(filePath, filename) {
   );
 }
 
-// Create secure download link
+// Generate secure download link
 function createDownloadUrl(filename) {
   const expires = Math.floor(Date.now() / 1000) + 3600;
 
@@ -173,7 +193,7 @@ async function readUsage(key) {
   }
 }
 
-// Main processing API
+// Main API
 export async function POST(request) {
   let tempDir;
   let lockKey;
@@ -192,15 +212,13 @@ export async function POST(request) {
     for (const key of required) {
       if (!process.env[key]) {
         return NextResponse.json(
-          {
-            error: `Missing environment variable: ${key}`,
-          },
+          { error: `Missing environment variable: ${key}` },
           { status: 500 }
         );
       }
     }
 
-    // Read submitted form
+    // Read upload form
     const form = await request.formData();
 
     const sessionId = form.get("session_id");
@@ -234,7 +252,7 @@ export async function POST(request) {
       );
     }
 
-    // Get uploaded videos
+    // Get videos
     const files = form.getAll("videos").filter(
       (file) =>
         file &&
@@ -249,7 +267,7 @@ export async function POST(request) {
       );
     }
 
-    // Validate videos
+    // Validate files
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
@@ -281,7 +299,7 @@ export async function POST(request) {
       );
     }
 
-    // Create package keys
+    // Package identification
     const paymentHash = createHash("sha256")
       .update(sessionId)
       .digest("hex");
@@ -292,7 +310,7 @@ export async function POST(request) {
     lockKey =
       `processing-locks/${paymentHash}.json`;
 
-    // Prevent simultaneous package processing
+    // Prevent simultaneous processing
     try {
       await r2.send(
         new PutObjectCommand({
@@ -325,7 +343,7 @@ export async function POST(request) {
       throw error;
     }
 
-    // Check remaining package credits
+    // Check remaining credits
     const used = await readUsage(usageKey);
     const remaining = 3 - used;
 
@@ -339,14 +357,14 @@ export async function POST(request) {
       );
     }
 
-    // Create temporary folder
+    // Temporary workspace
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
     const results = [];
 
-    // Process each video separately
+    // Process one video at a time
     for (const file of files) {
       const id = randomUUID();
 
@@ -362,18 +380,18 @@ export async function POST(request) {
         outputName
       );
 
+      console.log("Starting video processing:", {
+        filename: file.name,
+        size: file.size,
+      });
+
       // Save input video
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
-      console.log("Starting FFmpeg:", {
-        filename: file.name,
-        size: file.size,
-      });
-
-      // Process video
+      // Run optimized FFmpeg
       await runFFmpeg(
         inputPath,
         imagePath,
@@ -394,9 +412,11 @@ export async function POST(request) {
       // Remove temporary files
       await rm(inputPath, { force: true });
       await rm(outputPath, { force: true });
+
+      console.log("Video completed:", outputName);
     }
 
-    // Update package balance
+    // Update package balance only after successful processing
     const newUsed = used + files.length;
     const newRemaining = 3 - newUsed;
 
@@ -438,7 +458,7 @@ export async function POST(request) {
     );
 
   } finally {
-    // Release processing lock
+    // Release package lock
     if (lockAcquired && lockKey) {
       await r2.send(
         new DeleteObjectCommand({
@@ -446,14 +466,11 @@ export async function POST(request) {
           Key: lockKey,
         })
       ).catch((error) => {
-        console.error(
-          "Lock cleanup failed:",
-          error
-        );
+        console.error("Lock cleanup failed:", error);
       });
     }
 
-    // Clean temporary directory
+    // Clean temporary files
     if (tempDir) {
       await rm(tempDir, {
         recursive: true,
