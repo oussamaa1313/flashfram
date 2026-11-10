@@ -32,7 +32,7 @@ function runFFmpeg(input, image, output) {
       "-i", image,
 
       "-filter_complex",
-      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto[v]",
+      "[1:v][0:v]scale2ref=w=main_w:h=main_h[cat][base];[base][cat]overlay=0:0:enable='lt(mod(t,2),0.03)':format=auto[v]",
 
       "-map", "[v]",
       "-map", "0:a?",
@@ -48,6 +48,7 @@ function runFFmpeg(input, image, output) {
 
       "-shortest",
       "-movflags", "+faststart",
+
       output,
     ];
 
@@ -64,7 +65,9 @@ function runFFmpeg(input, image, output) {
     });
 
     proc.on("error", (error) => {
-      reject(new Error(`Unable to start FFmpeg: ${error.message}`));
+      reject(
+        new Error(`Unable to start FFmpeg: ${error.message}`)
+      );
     });
 
     proc.on("close", (code, signal) => {
@@ -86,6 +89,7 @@ export async function POST(request) {
   const outputFiles = [];
 
   try {
+    // Check Stripe secret key
     if (!process.env.STRIPE_SECRET_KEY) {
       return NextResponse.json(
         { error: "Stripe secret key is missing." },
@@ -93,9 +97,11 @@ export async function POST(request) {
       );
     }
 
+    // Read form data
     const form = await request.formData();
     const sessionId = form.get("session_id");
 
+    // Validate Stripe session
     if (
       typeof sessionId !== "string" ||
       !/^cs_(test|live)_/.test(sessionId)
@@ -106,9 +112,16 @@ export async function POST(request) {
       );
     }
 
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    // Initialize Stripe
+    const stripe = new Stripe(
+      process.env.STRIPE_SECRET_KEY
+    );
 
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId
+    );
+
+    // Verify $10 USD payment
     if (
       session.payment_status !== "paid" ||
       session.amount_total !== 1000 ||
@@ -120,6 +133,7 @@ export async function POST(request) {
       );
     }
 
+    // Get uploaded videos
     const files = form.getAll("videos").filter(
       (file) =>
         file &&
@@ -127,6 +141,7 @@ export async function POST(request) {
         file.size > 0
     );
 
+    // Allow 1 to 3 videos
     if (files.length < 1 || files.length > 3) {
       return NextResponse.json(
         { error: "Choose between 1 and 3 videos." },
@@ -134,24 +149,29 @@ export async function POST(request) {
       );
     }
 
+    // Validate videos
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          { error: "Each file must be a video smaller than 250 MB." },
+          {
+            error: "Each file must be a video smaller than 250 MB."
+          },
           { status: 400 }
         );
       }
     }
 
+    // Cat image path
     const imagePath = path.join(
       process.cwd(),
       "public",
       "cat-image.png"
     );
 
+    // Check image
     try {
       await access(imagePath);
     } catch {
@@ -161,20 +181,25 @@ export async function POST(request) {
       );
     }
 
+    // Create temporary directory
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
+    // Create downloads directory
     const outputDir = path.join(
       process.cwd(),
       "public",
       "downloads"
     );
 
-    await mkdir(outputDir, { recursive: true });
+    await mkdir(outputDir, {
+      recursive: true,
+    });
 
     const results = [];
 
+    // Process each video
     for (const file of files) {
       const id = randomUUID();
 
@@ -184,46 +209,63 @@ export async function POST(request) {
       );
 
       const outputName = `${id}.mp4`;
-      const outputPath = path.join(outputDir, outputName);
 
+      const outputPath = path.join(
+        outputDir,
+        outputName
+      );
+
+      // Save uploaded video
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
+      // Register output for cleanup if processing fails
+      outputFiles.push(outputPath);
+
+      // Apply full-screen cat image every 2 seconds
       await runFFmpeg(
         inputPath,
         imagePath,
         outputPath
       );
 
-      outputFiles.push(outputPath);
-
       results.push({
         url: `/api/download/${outputName}`,
       });
     }
 
+    // Return processed videos
     return NextResponse.json({
       success: true,
       files: results,
     });
 
   } catch (error) {
-    console.error("FlashFrame processing error:", error);
+    console.error(
+      "FlashFrame processing error:",
+      error
+    );
 
+    // Delete incomplete output files
     for (const file of outputFiles) {
-      await rm(file, { force: true }).catch(() => {});
+      await rm(file, {
+        force: true,
+      }).catch(() => {});
     }
 
     return NextResponse.json(
       {
-        error: error.message || "Video processing failed.",
+        error:
+          error.message ||
+          "Video processing failed.",
       },
       { status: 500 }
     );
 
   } finally {
+    // Remove temporary directory
     if (tempDir) {
       await rm(tempDir, {
         recursive: true,
