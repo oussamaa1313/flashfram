@@ -32,7 +32,7 @@ function runFFmpeg(input, image, output) {
       "-i", image,
 
       "-filter_complex",
-      "[1:v][0:v]scale2ref=w=main_w:h=main_h[cat][base];[base][cat]overlay=0:0:enable='lt(mod(t,2),0.03)':format=auto[v]",
+      "[1:v][0:v]scale2ref=w=rw:h=rh:force_original_aspect_ratio=disable[cat][base];[cat]setsar=1[fullcat];[base][fullcat]overlay=0:0:enable='lt(mod(t,2),0.03)':eof_action=repeat:format=auto[v]",
 
       "-map", "[v]",
       "-map", "0:a?",
@@ -66,7 +66,9 @@ function runFFmpeg(input, image, output) {
 
     proc.on("error", (error) => {
       reject(
-        new Error(`Unable to start FFmpeg: ${error.message}`)
+        new Error(
+          `Unable to start FFmpeg: ${error.message}`
+        )
       );
     });
 
@@ -107,7 +109,9 @@ export async function POST(request) {
       !/^cs_(test|live)_/.test(sessionId)
     ) {
       return NextResponse.json(
-        { error: "A valid Stripe Checkout session is required." },
+        {
+          error: "A valid Stripe Checkout session is required."
+        },
         { status: 400 }
       );
     }
@@ -117,6 +121,7 @@ export async function POST(request) {
       process.env.STRIPE_SECRET_KEY
     );
 
+    // Retrieve payment
     const session = await stripe.checkout.sessions.retrieve(
       sessionId
     );
@@ -171,7 +176,7 @@ export async function POST(request) {
       "cat-image.png"
     );
 
-    // Check image
+    // Check image exists
     try {
       await access(imagePath);
     } catch {
@@ -221,10 +226,10 @@ export async function POST(request) {
         Buffer.from(await file.arrayBuffer())
       );
 
-      // Register output for cleanup if processing fails
+      // Register output for cleanup
       outputFiles.push(outputPath);
 
-      // Apply full-screen cat image every 2 seconds
+      // Apply full-screen cat image
       await runFFmpeg(
         inputPath,
         imagePath,
@@ -248,7 +253,7 @@ export async function POST(request) {
       error
     );
 
-    // Delete incomplete output files
+    // Delete generated files if processing fails
     for (const file of outputFiles) {
       await rm(file, {
         force: true,
