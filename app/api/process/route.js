@@ -12,7 +12,7 @@ import {
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHmac } from "node:crypto";
 
 import {
   S3Client,
@@ -115,6 +115,20 @@ async function uploadToR2(filePath, filename) {
   );
 }
 
+// Generate secure download URL
+function createDownloadUrl(filename) {
+  const expires = Math.floor(Date.now() / 1000) + 3600;
+
+  const signature = createHmac(
+    "sha256",
+    process.env.DOWNLOAD_SECRET
+  )
+    .update(`${filename}:${expires}`)
+    .digest("hex");
+
+  return `/api/download/${filename}?expires=${expires}&signature=${signature}`;
+}
+
 // Main API
 export async function POST(request) {
   let tempDir;
@@ -127,6 +141,7 @@ export async function POST(request) {
       "R2_ACCESS_KEY_ID",
       "R2_SECRET_ACCESS_KEY",
       "R2_BUCKET_NAME",
+      "DOWNLOAD_SECRET",
     ];
 
     for (const key of required) {
@@ -256,10 +271,10 @@ export async function POST(request) {
         outputName
       );
 
-      // Return download API URL
+      // Return signed download URL (valid for 1 hour)
       results.push({
         filename: outputName,
-        url: `/api/download/${outputName}`,
+        url: createDownloadUrl(outputName),
       });
 
       // Remove temporary files
