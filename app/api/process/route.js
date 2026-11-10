@@ -202,7 +202,7 @@ export async function POST(request) {
       outputFiles.push(outputPath);
 
       results.push({
-        url: `/downloads/${outputName}`,
+        url: `/api/download/${outputName}`,
       });
     }
 
