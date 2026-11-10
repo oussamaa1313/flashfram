@@ -1,10 +1,7 @@
 
 import { NextResponse } from "next/server";
+import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
 import { Readable } from "node:stream";
-import {
-  S3Client,
-  GetObjectCommand,
-} from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
 
@@ -23,24 +20,15 @@ export async function GET(request, context) {
 
     if (!/^[a-f0-9-]{36}\.mp4$/i.test(filename)) {
       return NextResponse.json(
-        { error: "Invalid download filename." },
+        { error: "Invalid filename." },
         { status: 400 }
       );
     }
 
-    if (!process.env.R2_BUCKET_NAME) {
-      return NextResponse.json(
-        { error: "R2 bucket configuration is missing." },
-        { status: 500 }
-      );
-    }
-
-    const objectKey = `processed/${filename.replace(".mp4", "")}.mp4`;
-
     const result = await r2.send(
       new GetObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
-        Key: objectKey,
+        Key: `processed/${filename}`,
       })
     );
 
@@ -51,35 +39,23 @@ export async function GET(request, context) {
       );
     }
 
-    const stream = result.Body;
+    const stream = Readable.toWeb(result.Body);
 
-    return new Response(Readable.toWeb(stream), {
+    return new Response(stream, {
       headers: {
         "Content-Type": "video/mp4",
-        "Content-Length": String(result.ContentLength || 0),
         "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Length": String(result.ContentLength),
         "Cache-Control": "private, no-store",
-        "X-Content-Type-Options": "nosniff",
       },
     });
 
   } catch (error) {
     console.error("R2 download error:", error);
 
-    if (
-      error.name === "NoSuchKey" ||
-      error.name === "NotFound"
-    ) {
-      return NextResponse.json(
-        { error: "Video not found." },
-        { status: 404 }
-      );
-    }
-
     return NextResponse.json(
-      { error: "Download unavailable. Please try again." },
-      { status: 500 }
+      { error: "Video not found or unavailable." },
+      { status: 404 }
     );
   }
 }
-
