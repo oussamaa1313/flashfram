@@ -12,11 +12,16 @@ import {
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { randomUUID, createHmac } from "node:crypto";
+import {
+  randomUUID,
+  createHmac,
+  createHash,
+} from "node:crypto";
 
 import {
   S3Client,
   PutObjectCommand,
+  DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
@@ -132,6 +137,8 @@ function createDownloadUrl(filename) {
 // Main API
 export async function POST(request) {
   let tempDir;
+  let lockKey;
+  let lockAcquired = false;
 
   try {
     // Check environment variables
@@ -229,6 +236,42 @@ export async function POST(request) {
       );
     }
 
+    // Lock Stripe payment: one use only
+    const paymentHash = createHash("sha256")
+      .update(sessionId)
+      .digest("hex");
+
+    lockKey = `payment-locks/${paymentHash}.json`;
+
+    try {
+      await r2.send(
+        new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: lockKey,
+          Body: JSON.stringify({
+            sessionIdHash: paymentHash,
+            createdAt: new Date().toISOString(),
+          }),
+          ContentType: "application/json",
+          IfNoneMatch: "*",
+        })
+      );
+
+      lockAcquired = true;
+    } catch (error) {
+      if (
+        error.name === "PreconditionFailed" ||
+        error.$metadata?.httpStatusCode === 412
+      ) {
+        return NextResponse.json(
+          { error: "This payment has already been used." },
+          { status: 409 }
+        );
+      }
+
+      throw error;
+    }
+
     // Temporary processing directory
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
@@ -252,7 +295,6 @@ export async function POST(request) {
         outputName
       );
 
-      // Save original video temporarily
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
@@ -271,13 +313,12 @@ export async function POST(request) {
         outputName
       );
 
-      // Return signed download URL (valid for 1 hour)
+      // Return signed download URL
       results.push({
         filename: outputName,
         url: createDownloadUrl(outputName),
       });
 
-      // Remove temporary files
       await rm(inputPath, { force: true });
       await rm(outputPath, { force: true });
     }
@@ -290,6 +331,18 @@ export async function POST(request) {
 
   } catch (error) {
     console.error("FlashFrame processing error:", error);
+
+    // Release payment lock if processing failed
+    if (lockAcquired && lockKey) {
+      await r2.send(
+        new DeleteObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: lockKey,
+        })
+      ).catch((deleteError) => {
+        console.error("Payment lock cleanup failed:", deleteError);
+      });
+    }
 
     return NextResponse.json(
       {
