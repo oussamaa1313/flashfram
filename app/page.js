@@ -9,6 +9,7 @@ export default function Home() {
   const [msg, setMsg] = useState("");
   const [downloads, setDownloads] = useState([]);
   const [paid, setPaid] = useState(false);
+  const [packageUsed, setPackageUsed] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -50,47 +51,50 @@ export default function Home() {
   function handleFiles(event) {
     const selected = Array.from(event.target.files || []);
 
-    if (selected.length > 3) {
-      setFiles([]);
+    if (!selected.length) return;
+
+    if (files.length + selected.length > 3) {
+      setMsg("Maximum 3 videos per package. Buy another package for more videos.");
       event.target.value = "";
-      setMsg("You can select a maximum of 3 videos.");
       return;
     }
 
     for (const file of selected) {
       if (!file.type.startsWith("video/")) {
-        setFiles([]);
-        event.target.value = "";
         setMsg("Only video files are allowed.");
+        event.target.value = "";
         return;
       }
 
       if (file.size > 250 * 1024 * 1024) {
-        setFiles([]);
-        event.target.value = "";
         setMsg("Each video must be smaller than 250 MB.");
+        event.target.value = "";
         return;
       }
 
       if (file.size === 0) {
-        setFiles([]);
+        setMsg("Empty video files are not allowed.");
         event.target.value = "";
-        setMsg("An empty video file cannot be uploaded.");
         return;
       }
     }
 
-    setFiles(selected);
+    setFiles((previous) => [...previous, ...selected]);
     setDownloads([]);
-    setMsg(
-      selected.length
-        ? `${selected.length} video(s) selected successfully.`
-        : ""
-    );
+    setMsg(`${files.length + selected.length} of 3 videos selected.`);
+
+    event.target.value = "";
+  }
+
+  function clearFiles() {
+    if (busy) return;
+
+    setFiles([]);
+    setMsg("Selected videos removed.");
   }
 
   async function processVideos() {
-    if (busy) return;
+    if (busy || packageUsed) return;
 
     if (!files.length || files.length > 3) {
       setMsg("Choose between 1 and 3 videos.");
@@ -126,15 +130,15 @@ export default function Home() {
       const d = await r.json();
 
       if (r.status === 409) {
+        setPackageUsed(true);
+        setPaid(false);
         throw new Error(
-          "This payment has already been used. Please complete a new payment."
+          "This package has already been used. Buy another package to process more videos."
         );
       }
 
       if (r.status === 402) {
-        throw new Error(
-          "Payment could not be verified. Please contact support."
-        );
+        throw new Error("Payment could not be verified.");
       }
 
       if (!r.ok) {
@@ -142,9 +146,11 @@ export default function Home() {
       }
 
       setDownloads(d.files || []);
-      setMsg("Your edited files are ready. Download them below.");
-
       setFiles([]);
+      setPackageUsed(true);
+      setPaid(false);
+
+      setMsg("Your package is complete! Your videos are ready.");
 
     } catch (e) {
       setMsg(e.message || "Something went wrong.");
@@ -173,7 +179,7 @@ export default function Home() {
 
         <p className="lead">
           Add consistent branding to your videos with a simple, fast editing
-          workflow. Upload up to three videos in one order.
+          workflow. Every package includes up to three videos.
         </p>
 
         <div className="offer">
@@ -185,13 +191,15 @@ export default function Home() {
           </span>
         </div>
 
-        <button
-          onClick={checkout}
-          disabled={busy}
-          className="primary"
-        >
-          {busy ? "Please wait…" : "Get started — $10"} <b>↗</b>
-        </button>
+        {!paid && (
+          <button
+            onClick={checkout}
+            disabled={busy}
+            className="primary"
+          >
+            {busy ? "Please wait…" : "Get started — $10"} <b>↗</b>
+          </button>
+        )}
 
         <p className="tiny">
           Secure card payment powered by Stripe · No subscription
@@ -202,29 +210,56 @@ export default function Home() {
         <div className="panelhead">
           <div>
             <small>YOUR WORKSPACE</small>
-            <h2>{paid ? "Payment confirmed" : "Start your order"}</h2>
+            <h2>
+              {paid
+                ? "Payment confirmed"
+                : packageUsed
+                ? "Package completed"
+                : "Start your order"}
+            </h2>
           </div>
 
           <span className="count">01 / 03</span>
         </div>
 
-        {paid ? (
+        {paid && !packageUsed ? (
           <>
             <p className="muted">
-              Your payment is confirmed. Upload up to three videos for branding edits.
+              Your $10 payment is confirmed. Upload up to three videos.
             </p>
 
             <input
               type="file"
-              accept="video/*"
+              accept="video/mp4,video/quicktime,video/webm"
               multiple
-              disabled={busy}
+              disabled={busy || files.length >= 3}
               onChange={handleFiles}
             />
 
             <p className="muted">
               {files.length} of 3 videos selected
             </p>
+
+            {files.length > 0 && (
+              <div className="selected-files">
+                {files.map((file, index) => (
+                  <p key={`${file.name}-${index}`}>
+                    {index + 1}. {file.name}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {files.length > 0 && (
+              <button
+                type="button"
+                className="secondary"
+                disabled={busy}
+                onClick={clearFiles}
+              >
+                Clear selected videos
+              </button>
+            )}
 
             <button
               className="primary"
@@ -234,11 +269,26 @@ export default function Home() {
               {busy ? "Processing…" : "Upload and process"}
             </button>
           </>
+        ) : packageUsed ? (
+          <div className="locked">
+            <h3>Your package is complete!</h3>
+            <p>
+              You can purchase another $10 package to process up to 3 more videos.
+            </p>
+
+            <button
+              className="primary"
+              onClick={checkout}
+              disabled={busy}
+            >
+              {busy ? "Please wait…" : "Buy another package — $10"}
+            </button>
+          </div>
         ) : (
           <div className="locked">
             <div className="lock">↗</div>
             <h3>Upload unlocks after checkout</h3>
-            <p>Pay once, then upload up to three videos.</p>
+            <p>Pay $10, then upload up to three videos.</p>
           </div>
         )}
 
@@ -270,8 +320,8 @@ export default function Home() {
         <div className="stepgrid">
           <article>
             <b>01</b>
-            <h3>Pay once</h3>
-            <p>Secure $10 checkout with Stripe.</p>
+            <h3>Pay $10</h3>
+            <p>One package includes up to 3 videos.</p>
           </article>
 
           <article>
