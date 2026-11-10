@@ -28,10 +28,11 @@ function runFFmpeg(input, image, output) {
       "-filter_complex_threads", "1",
 
       "-i", input,
+      "-loop", "1",
       "-i", image,
 
       "-filter_complex",
-      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto:shortest=1[v]",
+      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto[v]",
 
       "-map", "[v]",
       "-map", "0:a?",
@@ -45,6 +46,7 @@ function runFFmpeg(input, image, output) {
       "-c:a", "aac",
       "-b:a", "128k",
 
+      "-shortest",
       "-movflags", "+faststart",
       output,
     ];
@@ -62,9 +64,7 @@ function runFFmpeg(input, image, output) {
     });
 
     proc.on("error", (error) => {
-      reject(
-        new Error(`Unable to start FFmpeg: ${error.message}`)
-      );
+      reject(new Error(`Unable to start FFmpeg: ${error.message}`));
     });
 
     proc.on("close", (code, signal) => {
@@ -140,9 +140,7 @@ export async function POST(request) {
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          {
-            error: "Each file must be a video smaller than 250 MB.",
-          },
+          { error: "Each file must be a video smaller than 250 MB." },
           { status: 400 }
         );
       }
@@ -212,10 +210,7 @@ export async function POST(request) {
     });
 
   } catch (error) {
-    console.error(
-      "FlashFrame processing error:",
-      error
-    );
+    console.error("FlashFrame processing error:", error);
 
     for (const file of outputFiles) {
       await rm(file, { force: true }).catch(() => {});
