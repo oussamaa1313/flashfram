@@ -7,6 +7,7 @@ import {
   mkdir,
   writeFile,
   rm,
+  access,
 } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -21,25 +22,29 @@ function runFFmpeg(input, image, output) {
 
     const args = [
       "-y",
+      "-hide_banner",
+      "-loglevel", "warning",
+      "-filter_threads", "1",
+      "-filter_complex_threads", "1",
+
       "-i", input,
-      "-loop", "1",
       "-i", image,
 
       "-filter_complex",
-      "[1:v]scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto[v]",
+      "[1:v]format=rgba,scale=iw*0.20:-1[wm];[0:v][wm]overlay=W-w-24:H-h-24:format=auto:shortest=1[v]",
 
       "-map", "[v]",
       "-map", "0:a?",
 
       "-c:v", "libx264",
-      "-preset", "veryfast",
+      "-preset", "ultrafast",
+      "-threads", "2",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
 
       "-c:a", "aac",
       "-b:a", "128k",
 
-      "-shortest",
       "-movflags", "+faststart",
       output,
     ];
@@ -51,21 +56,24 @@ function runFFmpeg(input, image, output) {
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
 
-      if (errorText.length > 12000) {
-        errorText = errorText.slice(-12000);
+      if (errorText.length > 15000) {
+        errorText = errorText.slice(-15000);
       }
     });
 
-    proc.on("error", reject);
+    proc.on("error", (error) => {
+      reject(
+        new Error(`Unable to start FFmpeg: ${error.message}`)
+      );
+    });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
       if (code === 0) {
         resolve();
       } else {
         reject(
           new Error(
-            errorText.slice(-2000) ||
-            `FFmpeg exited with code ${code}`
+            `FFmpeg failed. Exit code: ${code}, Signal: ${signal}\n${errorText.slice(-5000)}`
           )
         );
       }
@@ -75,6 +83,7 @@ function runFFmpeg(input, image, output) {
 
 export async function POST(request) {
   let tempDir;
+  const outputFiles = [];
 
   try {
     if (!process.env.STRIPE_SECRET_KEY) {
@@ -98,7 +107,6 @@ export async function POST(request) {
     }
 
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
     const session = await stripe.checkout.sessions.retrieve(sessionId);
 
     if (
@@ -107,17 +115,17 @@ export async function POST(request) {
       session.currency !== "usd"
     ) {
       return NextResponse.json(
-        { error: "Payment not verified. Complete the $10 checkout first." },
+        { error: "Payment not verified." },
         { status: 402 }
       );
     }
 
-   const files = form.getAll("videos").filter(
-  (file) =>
-    file &&
-    typeof file.arrayBuffer === "function" &&
-    file.size > 0
-);
+    const files = form.getAll("videos").filter(
+      (file) =>
+        file &&
+        typeof file.arrayBuffer === "function" &&
+        file.size > 0
+    );
 
     if (files.length < 1 || files.length > 3) {
       return NextResponse.json(
@@ -132,7 +140,9 @@ export async function POST(request) {
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          { error: "Each file must be a video smaller than 250 MB." },
+          {
+            error: "Each file must be a video smaller than 250 MB.",
+          },
           { status: 400 }
         );
       }
@@ -143,8 +153,6 @@ export async function POST(request) {
       "public",
       "cat-image.png"
     );
-
-    const { access } = await import("node:fs/promises");
 
     try {
       await access(imagePath);
@@ -172,7 +180,11 @@ export async function POST(request) {
     for (const file of files) {
       const id = randomUUID();
 
-      const inputPath = path.join(tempDir, `${id}-input`);
+      const inputPath = path.join(
+        tempDir,
+        `${id}-input`
+      );
+
       const outputName = `${id}.mp4`;
       const outputPath = path.join(outputDir, outputName);
 
@@ -181,7 +193,13 @@ export async function POST(request) {
         Buffer.from(await file.arrayBuffer())
       );
 
-      await runFFmpeg(inputPath, imagePath, outputPath);
+      await runFFmpeg(
+        inputPath,
+        imagePath,
+        outputPath
+      );
+
+      outputFiles.push(outputPath);
 
       results.push({
         url: `/downloads/${outputName}`,
@@ -194,7 +212,14 @@ export async function POST(request) {
     });
 
   } catch (error) {
-    console.error("FlashFrame processing error:", error);
+    console.error(
+      "FlashFrame processing error:",
+      error
+    );
+
+    for (const file of outputFiles) {
+      await rm(file, { force: true }).catch(() => {});
+    }
 
     return NextResponse.json(
       {
