@@ -1,47 +1,116 @@
 
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 
 export default function Home() {
   const [files, setFiles] = useState([]);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [downloads, setDownloads] = useState([]);
+  const [paid, setPaid] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    setPaid(
+      params.get("paid") === "1" &&
+      !!params.get("session_id")
+    );
+  }, []);
 
   async function checkout() {
+    if (busy) return;
+
     setBusy(true);
     setMsg("Opening secure checkout…");
 
     try {
-      const r = await fetch("/api/checkout", { method: "POST" });
+      const r = await fetch("/api/checkout", {
+        method: "POST",
+      });
+
       const d = await r.json();
 
-      if (!r.ok) throw new Error(d.error || "Checkout unavailable");
+      if (!r.ok) {
+        throw new Error(d.error || "Checkout unavailable");
+      }
 
-      location.href = d.url;
+      if (!d.url) {
+        throw new Error("Checkout URL missing.");
+      }
+
+      window.location.href = d.url;
+
     } catch (e) {
       setMsg(e.message);
       setBusy(false);
     }
   }
 
-  async function process() {
+  function handleFiles(event) {
+    const selected = Array.from(event.target.files || []);
+
+    if (selected.length > 3) {
+      setFiles([]);
+      event.target.value = "";
+      setMsg("You can select a maximum of 3 videos.");
+      return;
+    }
+
+    for (const file of selected) {
+      if (!file.type.startsWith("video/")) {
+        setFiles([]);
+        event.target.value = "";
+        setMsg("Only video files are allowed.");
+        return;
+      }
+
+      if (file.size > 250 * 1024 * 1024) {
+        setFiles([]);
+        event.target.value = "";
+        setMsg("Each video must be smaller than 250 MB.");
+        return;
+      }
+
+      if (file.size === 0) {
+        setFiles([]);
+        event.target.value = "";
+        setMsg("An empty video file cannot be uploaded.");
+        return;
+      }
+    }
+
+    setFiles(selected);
+    setDownloads([]);
+    setMsg(
+      selected.length
+        ? `${selected.length} video(s) selected successfully.`
+        : ""
+    );
+  }
+
+  async function processVideos() {
+    if (busy) return;
+
     if (!files.length || files.length > 3) {
       setMsg("Choose between 1 and 3 videos.");
       return;
     }
 
-    const params = new URLSearchParams(location.search);
+    const params = new URLSearchParams(window.location.search);
     const sid = params.get("session_id");
 
-    if (!sid) {
+    if (!sid || !/^cs_(test|live)_/.test(sid)) {
       setMsg("Complete payment before uploading.");
       return;
     }
 
     const fd = new FormData();
-    files.forEach((file) => fd.append("videos", file));
+
+    files.forEach((file) => {
+      fd.append("videos", file);
+    });
+
     fd.append("session_id", sid);
 
     setBusy(true);
@@ -56,31 +125,52 @@ export default function Home() {
 
       const d = await r.json();
 
-      if (!r.ok) throw new Error(d.error || "Processing failed");
+      if (r.status === 409) {
+        throw new Error(
+          "This payment has already been used. Please complete a new payment."
+        );
+      }
+
+      if (r.status === 402) {
+        throw new Error(
+          "Payment could not be verified. Please contact support."
+        );
+      }
+
+      if (!r.ok) {
+        throw new Error(d.error || "Processing failed.");
+      }
 
       setDownloads(d.files || []);
       setMsg("Your edited files are ready. Download them below.");
+
+      setFiles([]);
+
     } catch (e) {
-      setMsg(e.message);
+      setMsg(e.message || "Something went wrong.");
     } finally {
       setBusy(false);
     }
   }
 
-  const paid =
-    typeof window !== "undefined" &&
-    new URLSearchParams(window.location.search).get("paid") === "1";
-
   return (
     <main>
       <nav>
-        <a className="logo" href="/">FLASH<span>FRAME</span></a>
+        <a className="logo" href="/">
+          FLASH<span>FRAME</span>
+        </a>
         <span className="navnote">Simple video branding</span>
       </nav>
 
       <section className="hero">
         <div className="pill">VIDEO EDITING MADE SIMPLE</div>
-        <h1>Make every video<br /><em>look unmistakably yours.</em></h1>
+
+        <h1>
+          Make every video
+          <br />
+          <em>look unmistakably yours.</em>
+        </h1>
+
         <p className="lead">
           Add consistent branding to your videos with a simple, fast editing
           workflow. Upload up to three videos in one order.
@@ -88,10 +178,18 @@ export default function Home() {
 
         <div className="offer">
           <strong>$10</strong>
-          <span>one-time payment<br />up to 3 videos</span>
+          <span>
+            one-time payment
+            <br />
+            up to 3 videos
+          </span>
         </div>
 
-        <button onClick={checkout} disabled={busy} className="primary">
+        <button
+          onClick={checkout}
+          disabled={busy}
+          className="primary"
+        >
           {busy ? "Please wait…" : "Get started — $10"} <b>↗</b>
         </button>
 
@@ -106,6 +204,7 @@ export default function Home() {
             <small>YOUR WORKSPACE</small>
             <h2>{paid ? "Payment confirmed" : "Start your order"}</h2>
           </div>
+
           <span className="count">01 / 03</span>
         </div>
 
@@ -117,17 +216,20 @@ export default function Home() {
 
             <input
               type="file"
-              accept="video/mp4,video/quicktime,video/webm"
+              accept="video/*"
               multiple
-              onChange={(e) => setFiles(Array.from(e.target.files || []))}
+              disabled={busy}
+              onChange={handleFiles}
             />
 
-            <p className="muted">{files.length} of 3 videos selected</p>
+            <p className="muted">
+              {files.length} of 3 videos selected
+            </p>
 
             <button
               className="primary"
-              disabled={busy}
-              onClick={process}
+              disabled={busy || files.length === 0}
+              onClick={processVideos}
             >
               {busy ? "Processing…" : "Upload and process"}
             </button>
@@ -140,11 +242,13 @@ export default function Home() {
           </div>
         )}
 
-        <p className="status">{msg}</p>
+        <p className="status" role="status">
+          {msg}
+        </p>
 
         <div className="downloads">
           {downloads.map((file, index) => (
-            <p key={file.url}>
+            <p key={file.filename}>
               <a
                 className="download"
                 href={file.url}
@@ -169,11 +273,13 @@ export default function Home() {
             <h3>Pay once</h3>
             <p>Secure $10 checkout with Stripe.</p>
           </article>
+
           <article>
             <b>02</b>
             <h3>Upload videos</h3>
             <p>Select up to three video files.</p>
           </article>
+
           <article>
             <b>03</b>
             <h3>Download</h3>
@@ -182,7 +288,9 @@ export default function Home() {
         </div>
       </section>
 
-      <footer>© 2026 FlashFrame · Video branding tools</footer>
+      <footer>
+        © 2026 FlashFrame · Video branding tools
+      </footer>
     </main>
   );
 }
