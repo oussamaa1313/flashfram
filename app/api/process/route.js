@@ -37,6 +37,7 @@ const r2 = new S3Client({
   },
 });
 
+// FFmpeg processing with diagnostic logs
 function runFFmpeg(input, image, output) {
   return new Promise((resolve, reject) => {
     const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
@@ -57,7 +58,7 @@ function runFFmpeg(input, image, output) {
       "-map", "0:a?",
       "-c:v", "libx264",
       "-preset", "ultrafast",
-      "-threads", "2",
+      "-threads", "1",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
       "-c:a", "aac",
@@ -68,26 +69,38 @@ function runFFmpeg(input, image, output) {
     ];
 
     const proc = spawn(ffmpegPath, args);
+
     let errorText = "";
 
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
+
       if (errorText.length > 12000) {
         errorText = errorText.slice(-12000);
       }
     });
 
     proc.on("error", (error) => {
-      reject(new Error(`FFmpeg startup failed: ${error.message}`));
+      console.error("FFmpeg startup error:", error);
+
+      reject(
+        new Error(`FFmpeg startup failed: ${error.message}`)
+      );
     });
 
-    proc.on("close", (code) => {
+    proc.on("close", (code, signal) => {
+      console.error("FFmpeg diagnostic:", {
+        code,
+        signal,
+        stderr: errorText.slice(-4000),
+      });
+
       if (code === 0) {
         resolve();
       } else {
         reject(
           new Error(
-            `FFmpeg failed with code ${code}: ${errorText.slice(-4000)}`
+            `FFmpeg stopped: code=${code}, signal=${signal || "none"}. Details: ${errorText.slice(-3000)}`
           )
         );
       }
@@ -95,6 +108,7 @@ function runFFmpeg(input, image, output) {
   });
 }
 
+// Upload processed video to Cloudflare R2
 async function uploadToR2(filePath, filename) {
   const fileInfo = await stat(filePath);
 
@@ -109,6 +123,7 @@ async function uploadToR2(filePath, filename) {
   );
 }
 
+// Create secure download link
 function createDownloadUrl(filename) {
   const expires = Math.floor(Date.now() / 1000) + 3600;
 
@@ -122,6 +137,7 @@ function createDownloadUrl(filename) {
   return `/api/download/${filename}?expires=${expires}&signature=${signature}`;
 }
 
+// Read package usage from R2
 async function readUsage(key) {
   try {
     const result = await r2.send(
@@ -131,7 +147,9 @@ async function readUsage(key) {
       })
     );
 
-    const data = JSON.parse(await result.Body.transformToString());
+    const data = JSON.parse(
+      await result.Body.transformToString()
+    );
 
     if (
       !Number.isInteger(data.used) ||
@@ -142,6 +160,7 @@ async function readUsage(key) {
     }
 
     return data.used;
+
   } catch (error) {
     if (
       error.name === "NoSuchKey" ||
@@ -154,6 +173,7 @@ async function readUsage(key) {
   }
 }
 
+// Main processing API
 export async function POST(request) {
   let tempDir;
   let lockKey;
@@ -172,13 +192,17 @@ export async function POST(request) {
     for (const key of required) {
       if (!process.env[key]) {
         return NextResponse.json(
-          { error: `Missing environment variable: ${key}` },
+          {
+            error: `Missing environment variable: ${key}`,
+          },
           { status: 500 }
         );
       }
     }
 
+    // Read submitted form
     const form = await request.formData();
+
     const sessionId = form.get("session_id");
 
     if (
@@ -191,9 +215,13 @@ export async function POST(request) {
       );
     }
 
-    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+    // Verify Stripe payment
+    const stripe = new Stripe(
+      process.env.STRIPE_SECRET_KEY
+    );
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
+    const session =
+      await stripe.checkout.sessions.retrieve(sessionId);
 
     if (
       session.payment_status !== "paid" ||
@@ -206,6 +234,7 @@ export async function POST(request) {
       );
     }
 
+    // Get uploaded videos
     const files = form.getAll("videos").filter(
       (file) =>
         file &&
@@ -220,18 +249,23 @@ export async function POST(request) {
       );
     }
 
+    // Validate videos
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          { error: "Each video must be a valid video smaller than 250 MB." },
+          {
+            error:
+              "Each video must be a valid video smaller than 250 MB.",
+          },
           { status: 400 }
         );
       }
     }
 
+    // Check overlay image
     const imagePath = path.join(
       process.cwd(),
       "public",
@@ -247,14 +281,18 @@ export async function POST(request) {
       );
     }
 
+    // Create package keys
     const paymentHash = createHash("sha256")
       .update(sessionId)
       .digest("hex");
 
-    const usageKey = `payment-usage/${paymentHash}.json`;
-    lockKey = `processing-locks/${paymentHash}.json`;
+    const usageKey =
+      `payment-usage/${paymentHash}.json`;
 
-    // Temporary lock prevents simultaneous use of the same package.
+    lockKey =
+      `processing-locks/${paymentHash}.json`;
+
+    // Prevent simultaneous package processing
     try {
       await r2.send(
         new PutObjectCommand({
@@ -269,13 +307,17 @@ export async function POST(request) {
       );
 
       lockAcquired = true;
+
     } catch (error) {
       if (
         error.name === "PreconditionFailed" ||
         error.$metadata?.httpStatusCode === 412
       ) {
         return NextResponse.json(
-          { error: "This package is currently being processed. Please wait." },
+          {
+            error:
+              "This package is currently being processed. Please wait.",
+          },
           { status: 409 }
         );
       }
@@ -283,6 +325,7 @@ export async function POST(request) {
       throw error;
     }
 
+    // Check remaining package credits
     const used = await readUsage(usageKey);
     const remaining = 3 - used;
 
@@ -296,39 +339,67 @@ export async function POST(request) {
       );
     }
 
+    // Create temporary folder
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
     const results = [];
 
+    // Process each video separately
     for (const file of files) {
       const id = randomUUID();
-      const inputPath = path.join(tempDir, `${id}-input`);
-      const outputName = `${id}.mp4`;
-      const outputPath = path.join(tempDir, outputName);
 
+      const inputPath = path.join(
+        tempDir,
+        `${id}-input`
+      );
+
+      const outputName = `${id}.mp4`;
+
+      const outputPath = path.join(
+        tempDir,
+        outputName
+      );
+
+      // Save input video
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
-      await runFFmpeg(inputPath, imagePath, outputPath);
-      await uploadToR2(outputPath, outputName);
+      console.log("Starting FFmpeg:", {
+        filename: file.name,
+        size: file.size,
+      });
+
+      // Process video
+      await runFFmpeg(
+        inputPath,
+        imagePath,
+        outputPath
+      );
+
+      // Upload result
+      await uploadToR2(
+        outputPath,
+        outputName
+      );
 
       results.push({
         filename: outputName,
         url: createDownloadUrl(outputName),
       });
 
+      // Remove temporary files
       await rm(inputPath, { force: true });
       await rm(outputPath, { force: true });
     }
 
+    // Update package balance
     const newUsed = used + files.length;
     const newRemaining = 3 - newUsed;
 
-    // Save the updated package balance.
     await r2.send(
       new PutObjectCommand({
         Bucket: process.env.R2_BUCKET_NAME,
@@ -352,14 +423,22 @@ export async function POST(request) {
     });
 
   } catch (error) {
-    console.error("FlashFrame processing error:", error);
+    console.error(
+      "FlashFrame processing error:",
+      error
+    );
 
     return NextResponse.json(
-      { error: error.message || "Video processing failed." },
+      {
+        error:
+          error.message ||
+          "Video processing failed.",
+      },
       { status: 500 }
     );
 
   } finally {
+    // Release processing lock
     if (lockAcquired && lockKey) {
       await r2.send(
         new DeleteObjectCommand({
@@ -367,10 +446,14 @@ export async function POST(request) {
           Key: lockKey,
         })
       ).catch((error) => {
-        console.error("Lock cleanup failed:", error);
+        console.error(
+          "Lock cleanup failed:",
+          error
+        );
       });
     }
 
+    // Clean temporary directory
     if (tempDir) {
       await rm(tempDir, {
         recursive: true,
