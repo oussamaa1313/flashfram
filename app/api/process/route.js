@@ -21,13 +21,13 @@ import {
 import {
   S3Client,
   PutObjectCommand,
+  GetObjectCommand,
   DeleteObjectCommand,
 } from "@aws-sdk/client-s3";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
 
-// Cloudflare R2 connection
 const r2 = new S3Client({
   region: "auto",
   endpoint: process.env.R2_ENDPOINT,
@@ -37,7 +37,6 @@ const r2 = new S3Client({
   },
 });
 
-// FFmpeg processing
 function runFFmpeg(input, image, output) {
   return new Promise((resolve, reject) => {
     const ffmpegPath = process.env.FFMPEG_PATH || "ffmpeg";
@@ -48,40 +47,31 @@ function runFFmpeg(input, image, output) {
       "-loglevel", "error",
       "-filter_threads", "1",
       "-filter_complex_threads", "1",
-
       "-i", input,
       "-loop", "1",
       "-framerate", "30",
       "-i", image,
-
       "-filter_complex",
       "[1:v][0:v]scale2ref=w=rw:h=rh[img][base];[img]format=rgba[img2];[base][img2]overlay=0:0:enable='lt(mod(t,2),0.04)':eof_action=repeat:format=auto[v]",
-
       "-map", "[v]",
       "-map", "0:a?",
-
       "-c:v", "libx264",
       "-preset", "ultrafast",
       "-threads", "2",
       "-crf", "23",
       "-pix_fmt", "yuv420p",
-
       "-c:a", "aac",
       "-b:a", "128k",
-
       "-shortest",
       "-movflags", "+faststart",
-
       output,
     ];
 
     const proc = spawn(ffmpegPath, args);
-
     let errorText = "";
 
     proc.stderr.on("data", (data) => {
       errorText += data.toString();
-
       if (errorText.length > 12000) {
         errorText = errorText.slice(-12000);
       }
@@ -105,7 +95,6 @@ function runFFmpeg(input, image, output) {
   });
 }
 
-// Upload processed video to R2
 async function uploadToR2(filePath, filename) {
   const fileInfo = await stat(filePath);
 
@@ -120,7 +109,6 @@ async function uploadToR2(filePath, filename) {
   );
 }
 
-// Generate secure download URL
 function createDownloadUrl(filename) {
   const expires = Math.floor(Date.now() / 1000) + 3600;
 
@@ -134,14 +122,44 @@ function createDownloadUrl(filename) {
   return `/api/download/${filename}?expires=${expires}&signature=${signature}`;
 }
 
-// Main API
+async function readUsage(key) {
+  try {
+    const result = await r2.send(
+      new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: key,
+      })
+    );
+
+    const data = JSON.parse(await result.Body.transformToString());
+
+    if (
+      !Number.isInteger(data.used) ||
+      data.used < 0 ||
+      data.used > 3
+    ) {
+      throw new Error("Invalid package usage record.");
+    }
+
+    return data.used;
+  } catch (error) {
+    if (
+      error.name === "NoSuchKey" ||
+      error.$metadata?.httpStatusCode === 404
+    ) {
+      return 0;
+    }
+
+    throw error;
+  }
+}
+
 export async function POST(request) {
   let tempDir;
   let lockKey;
   let lockAcquired = false;
 
   try {
-    // Check environment variables
     const required = [
       "STRIPE_SECRET_KEY",
       "R2_ENDPOINT",
@@ -160,7 +178,6 @@ export async function POST(request) {
       }
     }
 
-    // Read upload form
     const form = await request.formData();
     const sessionId = form.get("session_id");
 
@@ -174,12 +191,9 @@ export async function POST(request) {
       );
     }
 
-    // Verify Stripe payment
     const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-    const session = await stripe.checkout.sessions.retrieve(
-      sessionId
-    );
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
 
     if (
       session.payment_status !== "paid" ||
@@ -192,7 +206,6 @@ export async function POST(request) {
       );
     }
 
-    // Get uploaded videos
     const files = form.getAll("videos").filter(
       (file) =>
         file &&
@@ -207,20 +220,18 @@ export async function POST(request) {
       );
     }
 
-    // Validate files
     for (const file of files) {
       if (
         !file.type.startsWith("video/") ||
         file.size > 250 * 1024 * 1024
       ) {
         return NextResponse.json(
-          { error: "Each video must be smaller than 250 MB." },
+          { error: "Each video must be a valid video smaller than 250 MB." },
           { status: 400 }
         );
       }
     }
 
-    // Check cat image
     const imagePath = path.join(
       process.cwd(),
       "public",
@@ -236,20 +247,20 @@ export async function POST(request) {
       );
     }
 
-    // Lock Stripe payment: one use only
     const paymentHash = createHash("sha256")
       .update(sessionId)
       .digest("hex");
 
-    lockKey = `payment-locks/${paymentHash}.json`;
+    const usageKey = `payment-usage/${paymentHash}.json`;
+    lockKey = `processing-locks/${paymentHash}.json`;
 
+    // Temporary lock prevents simultaneous use of the same package.
     try {
       await r2.send(
         new PutObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: lockKey,
           Body: JSON.stringify({
-            sessionIdHash: paymentHash,
             createdAt: new Date().toISOString(),
           }),
           ContentType: "application/json",
@@ -264,7 +275,7 @@ export async function POST(request) {
         error.$metadata?.httpStatusCode === 412
       ) {
         return NextResponse.json(
-          { error: "This payment has already been used." },
+          { error: "This package is currently being processed. Please wait." },
           { status: 409 }
         );
       }
@@ -272,48 +283,39 @@ export async function POST(request) {
       throw error;
     }
 
-    // Temporary processing directory
+    const used = await readUsage(usageKey);
+    const remaining = 3 - used;
+
+    if (files.length > remaining) {
+      return NextResponse.json(
+        {
+          error: `Only ${remaining} video(s) remaining in this package.`,
+          remaining,
+        },
+        { status: 400 }
+      );
+    }
+
     tempDir = await mkdtemp(
       path.join(os.tmpdir(), "flashframe-")
     );
 
     const results = [];
 
-    // Process each video
     for (const file of files) {
       const id = randomUUID();
-
-      const inputPath = path.join(
-        tempDir,
-        `${id}-input`
-      );
-
+      const inputPath = path.join(tempDir, `${id}-input`);
       const outputName = `${id}.mp4`;
-
-      const outputPath = path.join(
-        tempDir,
-        outputName
-      );
+      const outputPath = path.join(tempDir, outputName);
 
       await writeFile(
         inputPath,
         Buffer.from(await file.arrayBuffer())
       );
 
-      // Add cat image every 2 seconds
-      await runFFmpeg(
-        inputPath,
-        imagePath,
-        outputPath
-      );
+      await runFFmpeg(inputPath, imagePath, outputPath);
+      await uploadToR2(outputPath, outputName);
 
-      // Upload final video to Cloudflare R2
-      await uploadToR2(
-        outputPath,
-        outputName
-      );
-
-      // Return signed download URL
       results.push({
         filename: outputName,
         url: createDownloadUrl(outputName),
@@ -323,35 +325,52 @@ export async function POST(request) {
       await rm(outputPath, { force: true });
     }
 
+    const newUsed = used + files.length;
+    const newRemaining = 3 - newUsed;
+
+    // Save the updated package balance.
+    await r2.send(
+      new PutObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: usageKey,
+        Body: JSON.stringify({
+          used: newUsed,
+          remaining: newRemaining,
+          updatedAt: new Date().toISOString(),
+        }),
+        ContentType: "application/json",
+      })
+    );
+
     return NextResponse.json({
       success: true,
-      message: "Videos processed and uploaded to Cloudflare R2.",
       files: results,
+      used: newUsed,
+      remaining: newRemaining,
+      packageCompleted: newRemaining === 0,
+      message: "Videos processed successfully.",
     });
 
   } catch (error) {
     console.error("FlashFrame processing error:", error);
 
-    // Release payment lock if processing failed
+    return NextResponse.json(
+      { error: error.message || "Video processing failed." },
+      { status: 500 }
+    );
+
+  } finally {
     if (lockAcquired && lockKey) {
       await r2.send(
         new DeleteObjectCommand({
           Bucket: process.env.R2_BUCKET_NAME,
           Key: lockKey,
         })
-      ).catch((deleteError) => {
-        console.error("Payment lock cleanup failed:", deleteError);
+      ).catch((error) => {
+        console.error("Lock cleanup failed:", error);
       });
     }
 
-    return NextResponse.json(
-      {
-        error: error.message || "Video processing failed.",
-      },
-      { status: 500 }
-    );
-
-  } finally {
     if (tempDir) {
       await rm(tempDir, {
         recursive: true,
