@@ -9,7 +9,7 @@ export default function Home() {
   const [msg, setMsg] = useState("");
   const [downloads, setDownloads] = useState([]);
   const [paid, setPaid] = useState(false);
-  const [packageUsed, setPackageUsed] = useState(false);
+  const [remaining, setRemaining] = useState(3);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -32,16 +32,10 @@ export default function Home() {
 
       const d = await r.json();
 
-      if (!r.ok) {
-        throw new Error(d.error || "Checkout unavailable");
-      }
-
-      if (!d.url) {
-        throw new Error("Checkout URL missing.");
-      }
+      if (!r.ok) throw new Error(d.error || "Checkout unavailable");
+      if (!d.url) throw new Error("Checkout URL missing.");
 
       window.location.href = d.url;
-
     } catch (e) {
       setMsg(e.message);
       setBusy(false);
@@ -53,8 +47,8 @@ export default function Home() {
 
     if (!selected.length) return;
 
-    if (files.length + selected.length > 3) {
-      setMsg("Maximum 3 videos per package. Buy another package for more videos.");
+    if (selected.length > remaining) {
+      setMsg(`Only ${remaining} video(s) remaining in your package.`);
       event.target.value = "";
       return;
     }
@@ -79,25 +73,17 @@ export default function Home() {
       }
     }
 
-    setFiles((previous) => [...previous, ...selected]);
+    setFiles(selected);
     setDownloads([]);
-    setMsg(`${files.length + selected.length} of 3 videos selected.`);
-
+    setMsg(`${selected.length} video(s) selected.`);
     event.target.value = "";
   }
 
-  function clearFiles() {
+  async function processVideos() {
     if (busy) return;
 
-    setFiles([]);
-    setMsg("Selected videos removed.");
-  }
-
-  async function processVideos() {
-    if (busy || packageUsed) return;
-
-    if (!files.length || files.length > 3) {
-      setMsg("Choose between 1 and 3 videos.");
+    if (!files.length || files.length > remaining) {
+      setMsg(`Choose between 1 and ${remaining} videos.`);
       return;
     }
 
@@ -110,11 +96,7 @@ export default function Home() {
     }
 
     const fd = new FormData();
-
-    files.forEach((file) => {
-      fd.append("videos", file);
-    });
-
+    files.forEach((file) => fd.append("videos", file));
     fd.append("session_id", sid);
 
     setBusy(true);
@@ -130,11 +112,7 @@ export default function Home() {
       const d = await r.json();
 
       if (r.status === 409) {
-        setPackageUsed(true);
-        setPaid(false);
-        throw new Error(
-          "This package has already been used. Buy another package to process more videos."
-        );
+        throw new Error("This package is currently processing. Please wait.");
       }
 
       if (r.status === 402) {
@@ -146,12 +124,17 @@ export default function Home() {
       }
 
       setDownloads(d.files || []);
+      setRemaining(d.remaining);
       setFiles([]);
-      setPackageUsed(true);
-      setPaid(false);
 
-      setMsg("Your package is complete! Your videos are ready.");
-
+      if (d.remaining === 0) {
+        setPaid(false);
+        setMsg("Package completed! Buy another $10 package for 3 more videos.");
+      } else {
+        setMsg(
+          `Success! ${d.remaining} video(s) remaining in your package.`
+        );
+      }
     } catch (e) {
       setMsg(e.message || "Something went wrong.");
     } finally {
@@ -162,9 +145,7 @@ export default function Home() {
   return (
     <main>
       <nav>
-        <a className="logo" href="/">
-          FLASH<span>FRAME</span>
-        </a>
+        <a className="logo" href="/">FLASH<span>FRAME</span></a>
         <span className="navnote">Simple video branding</span>
       </nav>
 
@@ -184,19 +165,11 @@ export default function Home() {
 
         <div className="offer">
           <strong>$10</strong>
-          <span>
-            one-time payment
-            <br />
-            up to 3 videos
-          </span>
+          <span>one-time payment<br />up to 3 videos</span>
         </div>
 
         {!paid && (
-          <button
-            onClick={checkout}
-            disabled={busy}
-            className="primary"
-          >
+          <button onClick={checkout} disabled={busy} className="primary">
             {busy ? "Please wait…" : "Get started — $10"} <b>↗</b>
           </button>
         )}
@@ -210,71 +183,61 @@ export default function Home() {
         <div className="panelhead">
           <div>
             <small>YOUR WORKSPACE</small>
-            <h2>
-              {paid
-                ? "Payment confirmed"
-                : packageUsed
-                ? "Package completed"
-                : "Start your order"}
-            </h2>
+            <h2>{paid ? "Payment confirmed" : "Start your order"}</h2>
           </div>
-
           <span className="count">01 / 03</span>
         </div>
 
-        {paid && !packageUsed ? (
+        {paid ? (
           <>
             <p className="muted">
-              Your $10 payment is confirmed. Upload up to three videos.
+              Your $10 package includes 3 videos.
             </p>
+
+            <h3>{remaining} of 3 videos remaining</h3>
 
             <input
               type="file"
               accept="video/mp4,video/quicktime,video/webm"
               multiple
-              disabled={busy || files.length >= 3}
+              disabled={busy || remaining === 0}
               onChange={handleFiles}
             />
 
             <p className="muted">
-              {files.length} of 3 videos selected
+              {files.length} video(s) selected
             </p>
 
             {files.length > 0 && (
-              <div className="selected-files">
+              <>
                 {files.map((file, index) => (
                   <p key={`${file.name}-${index}`}>
-                    {index + 1}. {file.name}
+                    {file.name}
                   </p>
                 ))}
-              </div>
-            )}
 
-            {files.length > 0 && (
-              <button
-                type="button"
-                className="secondary"
-                disabled={busy}
-                onClick={clearFiles}
-              >
-                Clear selected videos
-              </button>
+                <button
+                  className="secondary"
+                  disabled={busy}
+                  onClick={() => setFiles([])}
+                >
+                  Clear selected videos
+                </button>
+              </>
             )}
 
             <button
               className="primary"
-              disabled={busy || files.length === 0}
+              disabled={busy || files.length === 0 || remaining === 0}
               onClick={processVideos}
             >
               {busy ? "Processing…" : "Upload and process"}
             </button>
           </>
-        ) : packageUsed ? (
+        ) : (
           <div className="locked">
-            <h3>Your package is complete!</h3>
-            <p>
-              You can purchase another $10 package to process up to 3 more videos.
-            </p>
+            <h3>Package completed!</h3>
+            <p>Purchase another $10 package to process 3 more videos.</p>
 
             <button
               className="primary"
@@ -284,17 +247,9 @@ export default function Home() {
               {busy ? "Please wait…" : "Buy another package — $10"}
             </button>
           </div>
-        ) : (
-          <div className="locked">
-            <div className="lock">↗</div>
-            <h3>Upload unlocks after checkout</h3>
-            <p>Pay $10, then upload up to three videos.</p>
-          </div>
         )}
 
-        <p className="status" role="status">
-          {msg}
-        </p>
+        <p className="status" role="status">{msg}</p>
 
         <div className="downloads">
           {downloads.map((file, index) => (
@@ -323,13 +278,11 @@ export default function Home() {
             <h3>Pay $10</h3>
             <p>One package includes up to 3 videos.</p>
           </article>
-
           <article>
             <b>02</b>
             <h3>Upload videos</h3>
             <p>Select up to three video files.</p>
           </article>
-
           <article>
             <b>03</b>
             <h3>Download</h3>
@@ -338,9 +291,7 @@ export default function Home() {
         </div>
       </section>
 
-      <footer>
-        © 2026 FlashFrame · Video branding tools
-      </footer>
+      <footer>© 2026 FlashFrame · Video branding tools</footer>
     </main>
   );
 }
